@@ -6,77 +6,74 @@ import scala.util.parsing.combinator.Parsers
 import scala.util.parsing.input.Position
 import scala.util.parsing.input.Reader
 
-
-class Grammar(db: Database) extends Parsers {
+class Grammar(implicit db: Database) extends Parsers {
   type Elem = Sym
-  val parsers = new HashMap[Constant, Parser[ParseTree]]
+  val _parsers = new HashMap[Constant, Parser[ParseTree]]
   val axiomByTC = new HashMap[Constant, MutableList[(Assert, List[Sym])]]
-  db.decls foreach {
-    case a: Assert if a.proofUnparsed.isEmpty && db.vartyps.contains(a.formula.typecode) => {
-      a.frame.dv.foreach(_ => throw new MMError(s"Syntax axiom ${a.label} has a DV condition"))
-      a.frame.hyps.foreach {
+  val reorderMap = new HashMap[Assert, List[Int]]
+  def add(d: Declaration) = d match {
+    case a: Assert if a.proofUnparsed.isEmpty && db.vartyps.contains(a.typecode) => {
+      for (_ <- a.disjoint) throw new MMError(s"Syntax axiom ${a.label} has a DV condition")
+      a.hyps.foreach {
         case _: Essential => throw new MMError(s"Syntax axiom ${a.label} has a hypothesis")
         case _ =>
       }
-      axiomByTC.getOrElseUpdate(a.formula.typecode, new MutableList) += ((a, a.formula.expr))
+      a.syntax = true
+      axiomByTC.getOrElseUpdate(a.typecode, new MutableList) += ((a, a.formula.expr))
+      val vars = a.formula.expr collect { case v: Variable => v }
+      reorderMap.put(a, a.hyps collect { case h: Floating => vars.indexOf(h.v) })
+      _parsers.clear
     }
     case _ =>
   }
-  db.vartyps foreach { c =>
-    var varP = acceptMatch(c.id+" var", { case vr: Variable
-      if vr.activeFloat.typecode == c => HypNode(vr.activeFloat) })
-    parsers(c) = axiomByTC.get(c) match {
+
+  def parsers(c: Constant) = _parsers.getOrElseUpdate(c, {
+    var varP: Parser[ParseTree] = acceptMatch(c.id + " var", {
+      case vr: Variable if vr.activeFloat.typecode == c => vr.activeFloat
+    })
+    axiomByTC.get(c) match {
       case None => varP
-      case Some(l) => varP | buildParser(c.id, l)
+      case Some(l) => varP | (buildParser(c.id, l) ^^ { case (a, l) => AssertNode(a, reorderMap(a) map l) })
     }
-  }
+  })
 
-
-  def buildParser(name: String, axioms: Seq[(Assert, List[Sym])]): Parser[AssertNode] = {
-    val out = new MutableList[Parser[AssertNode]]
+  def buildParser(name: String, axioms: Seq[(Assert, List[Sym])]): Parser[(Assert, List[ParseTree])] = {
+    val out = new MutableList[Parser[(Assert, List[ParseTree])]]
     val constants = new HashMap[Constant, MutableList[(Assert, List[Sym])]]
     val variables = new HashMap[Constant, MutableList[(Assert, List[Sym])]]
-    axioms foreach { case (a, l) =>
+    for ((a, l) <- axioms)
       l.headOption match {
-        case None => out += success(AssertNode(a))
+        case None => out += success((a, Nil))
         case Some(s) => (s match {
           case c: Constant => constants.getOrElseUpdate(c, new MutableList)
           case v: Variable => variables.getOrElseUpdate(v.activeFloat.typecode, new MutableList)
         }) += ((a, l.tail))
       }
-    }
     if (!constants.isEmpty) {
-      val constantsLookup = new HashMap[Sym, Parser[AssertNode]]
-      constants foreach { case (c, l) => constantsLookup.put(c, buildParser(name + " " + c.id, l)) }
+      val constantsLookup = new HashMap[Sym, Parser[(Assert, List[ParseTree])]]
+      for ((c, l) <- constants) constantsLookup.put(c, buildParser(name + " " + c.id, l))
       out += Parser { in =>
         constantsLookup.get(in.first) match {
           case Some(p) => p(in.rest)
           case None => Failure("No match", in)
         }
       }
-    }    
-    variables foreach { case (c, l) =>
-      val sub = buildParser(s"$name <${c.id}>", l)
-      out += parsers(c) ~ sub ^^ { case v ~ t => v :: t }
     }
-    out.tail.foldRight(out.head)((a,b) => a | b).named(name)
+    for ((c, l) <- variables) {
+      val sub = buildParser(s"$name <${c.id}>", l)
+      out += parsers(c) ~ sub ^^ { case v ~ al => al match { case (a, l) => (a, v :: l) } }
+    }
+    out.tail.foldRight(out.head)(_ | _).named(name)
   }
-  
+
   def asConst(s: Sym): Option[Constant] = s match {
     case c: Constant => Some(c)
     case _ => None
   }
 
-  def parseAll {
-    db.decls foreach {
-      case Statement(label, formula) => parse(label, formula)
-      case _ =>
-    }
-  }
-
   def parse(label: String, formula: Formula) {
     val c = formula.typecode
-    val result = phrase(parsers.get(db.typecodes(c)).get).apply(new SeqReader(formula.expr))
+    val result = phrase(parsers(db.typecodes(c))).apply(new SeqReader(formula.expr))
     formula.parse = if (result.successful) result.get else throw new MMError(s"$result - while parsing $label: $formula")
   }
 }

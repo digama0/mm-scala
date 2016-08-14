@@ -7,18 +7,22 @@ import scala.collection.mutable.MutableList
 import scala.collection.mutable.Stack
 import scala.util.parsing.combinator.RegexParsers
 
-case class MMParser(in: io.Reader) {
+case class MMParser(in: io.Reader, checkDefn: Boolean = false) {
   private val frames = Stack(new Frame)
   val reader = new LineNumberReader(in)
 
   def parse: Database = {
-    var db = new Database
+    implicit var db = new Database(checkDefn)
     var lastComment: Option[Comment] = None
-    val cparser = new CommentParser(db)
+    val cparser = new CommentParser
     while (true) {
       var tok = getToken
       tok match {
-        case "" => return db
+        case "" =>
+          if (frames.size > 1)
+            throw MMError("Extra open scope")
+          db.defn.foreach(_.finish)
+          return db
         case "$(" =>
           val newComment = readUntilRaw("$)")
           lastComment = if (cparser parseComment newComment) None else Some(Comment(newComment))
@@ -38,6 +42,8 @@ case class MMParser(in: io.Reader) {
           lastComment = None
         case "$}" =>
           frames.pop
+          if (frames.isEmpty)
+            throw MMError("Cannot end global scope!")
           lastComment = None
         case _ =>
           getToken match {
@@ -63,10 +69,7 @@ case class MMParser(in: io.Reader) {
               db.statements += Assert(tok, formula, Assert.trimFrame(formula, frames.head), lastComment)
             case "$p" =>
               val formula = readFormula("$=")
-              val th = Assert(tok, formula, Assert.trimFrame(formula, frames.head), lastComment)
-              th.proofUnparsed = Some(readUntilRaw("$."))
-              db.statements += th
-              
+              db.statements += Assert(tok, formula, Assert.trimFrame(formula, frames.head), lastComment, Some(readUntilRaw("$.")))
             case k => throw MMError(s"Not a valid metamath command: $k at line ${reader.getLineNumber}")
           }
           lastComment = None
@@ -127,7 +130,7 @@ case class MMParser(in: io.Reader) {
   }
 }
 
-class CommentParser(db: Database) extends RegexParsers {
+class CommentParser(implicit db: Database) extends RegexParsers {
   var commentTyp: String = _
   lazy val specialCommentStart = "$j" | "$t"
   lazy val specialComment = rep(command) <~ blockComment
@@ -159,7 +162,7 @@ class CommentParser(db: Database) extends RegexParsers {
   def handleCommand(s: String, k: Keyword, l: List[CommandElement]) {
     (s, k.s) match {
       case ("$j", "syntax") =>
-        db.grammatical = true
+        db.initGrammar
         l match {
           case List(Arg(typ), Keyword("as"), Arg(vtyp)) => db.typecodes.put(typ, vtyp)
           case _ => l foreach {
@@ -167,15 +170,38 @@ class CommentParser(db: Database) extends RegexParsers {
             case _ => throw MMError("Invalid $j 'syntax' invocation")
           }
         }
-      case ("$j", "grammar") => db.grammatical = true
+      case ("$j", "grammar") => db.initGrammar
       case ("$j", "unambiguous") =>
-        db.grammatical = true
+        db.initGrammar
         db.unambiguous = true
         l match {
           case List() =>
           case List(Arg(parser)) =>
           case _ => throw MMError("Invalid $j 'unambiguous' invocation")
         }
+      case ("$j", "equality") => l match {
+        case List(Arg(eq), Keyword("from"), Arg(refl), Arg(sym), Arg(trans)) =>
+          db.defn.foreach(_.addEquality(db.asserts(eq), db.asserts(refl), db.asserts(sym), db.asserts(trans)))
+        case _ => throw MMError("Invalid $j 'equality' invocation")
+      }
+      case ("$j", "primitive") => l foreach {
+        case Arg(str) => db.defn.foreach(_ addPrimitive db.asserts(str))
+        case _ => throw MMError("Invalid $j 'primitive' invocation")
+      }
+      case ("$j", "congruence") => l foreach {
+        case Arg(str) => db.defn.foreach(_ addCongruence db.asserts(str))
+        case _ => throw MMError("Invalid $j 'congruence' invocation")
+      }
+      case ("$j", "definition") => l match {
+        case List(Arg(defn), Keyword("for"), Arg(syn)) =>
+          db.defn.foreach(_.addDefinition(db.asserts(defn), Some(db.asserts(syn))))
+        case _ => throw MMError("Invalid $j 'definition' invocation")
+      }
+      case ("$j", "justification") => l match {
+        case List(Arg(thm), Keyword("for"), Arg(syn)) =>
+          db.defn.foreach(_.addJustification(db.asserts(syn), db.asserts(thm)))
+        case _ => throw MMError("Invalid $j 'definition' invocation")
+      }
       case ("$j", _) =>
       case ("$t", "htmldef") => l match {
         case List(Arg(sym), Keyword("as"), Arg(value)) => db.htmldefs.put(sym, value)

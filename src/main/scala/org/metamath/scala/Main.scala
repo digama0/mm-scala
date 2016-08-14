@@ -8,11 +8,11 @@ object Main {
       case Array(file) =>
         val parser = new MMParser(new FileReader(file))
         println("File parsing...")
-        val db = parser.parse
-        println("Math parsing...")
-        new Grammar(db).parseAll
+        implicit val db = parser.parse
         println("Verify...")
-        new Verifier(db)
+        new Verifier
+        //println("Check definitions...")
+        //new DefinitionChecker
       case _ => println("Usage: mm-scala file.mm")
     }
   }
