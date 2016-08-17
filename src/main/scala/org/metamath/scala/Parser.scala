@@ -7,12 +7,13 @@ import scala.collection.mutable.MutableList
 import scala.collection.mutable.Stack
 import scala.util.parsing.combinator.RegexParsers
 
-case class MMParser(in: io.Reader, checkDefn: Boolean = false) {
+case class MMParser(in: io.Reader, strict: Boolean = false, checkDefn: Boolean = false) {
   private val frames = Stack(new Frame)
   val reader = new LineNumberReader(in)
 
   def parse: Database = {
     implicit var db = new Database(checkDefn)
+    if (!strict) db.initGrammar
     var lastComment: Option[Comment] = None
     val cparser = new CommentParser
     while (true) {
@@ -51,9 +52,13 @@ case class MMParser(in: io.Reader, checkDefn: Boolean = false) {
               readUntil("$.") match {
                 case List(cs, vs) => {
                   val v = db.syms(vs).asInstanceOf[Variable]
-                  val stmt = Floating(tok, db.syms(cs).asInstanceOf[Constant], v)
-                  if (!db.vartyps.contains(stmt.typecode))
-                    throw MMError(s"variable $v should have a variable typecode in ${stmt.label}")
+                  val typ = db.syms(cs).asInstanceOf[Constant]
+                  if (!db.vartyps.contains(typ)) {
+                    if (strict)
+                      throw MMError(s"variable $v should have a variable typecode in $tok")
+                    db.typecodes.put(cs, cs)
+                  }
+                  val stmt = Floating(tok, typ, v)
                   v.activeFloat = stmt
                   db.statements += stmt
                   frames push stmt :: frames.pop
@@ -61,14 +66,14 @@ case class MMParser(in: io.Reader, checkDefn: Boolean = false) {
                 case _ => throw MMError("Incorrect $f statement")
               }
             case "$e" =>
-              val stmt = Essential(tok, readFormula("$."))
+              val stmt = Essential(tok, readFormula(tok, "$."))
               db.statements += stmt
               frames push stmt :: frames.pop
             case "$a" =>
-              val formula = readFormula("$.")
+              val formula = readFormula(tok, "$.")
               db.statements += Assert(tok, formula, Assert.trimFrame(formula, frames.head), lastComment)
             case "$p" =>
-              val formula = readFormula("$=")
+              val formula = readFormula(tok, "$=")
               db.statements += Assert(tok, formula, Assert.trimFrame(formula, frames.head), lastComment, Some(readUntilRaw("$.")))
             case k => throw MMError(s"Not a valid metamath command: $k at line ${reader.getLineNumber}")
           }
@@ -76,9 +81,18 @@ case class MMParser(in: io.Reader, checkDefn: Boolean = false) {
       }
     }
 
-    def readFormula(s: String) = {
+    def readFormula(label: String, s: String) = {
       val ls = readUntil(s).map(db.syms)
-      Formula(ls.head.asInstanceOf[Constant], ls.tail)
+      val tc = ls.head.asInstanceOf[Constant]
+      if (!tc.tc) {
+        if (strict)
+          throw MMError(s"formula $label should start with a declared typecode")
+        else if (db.vartyps.size == 1)
+          db.typecodes.put(tc.id, db.vartyps.head.id)
+        else
+          db.typecodes.put(tc.id, tc.id)
+      }
+      Formula(tc, ls.tail)
     }
     db
   }
